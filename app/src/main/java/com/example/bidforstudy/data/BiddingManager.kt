@@ -11,7 +11,7 @@ data class AuctionKey(
 )
 
 data class BidEntry(
-    val bidderId: String,   // userId or "group:<joinCode>"
+    val bidderId: String,
     val amount: Int,
     val timestamp: LocalDateTime
 )
@@ -24,7 +24,7 @@ data class GroupMemberBid(
 data class PendingGroupBid(
     val key: AuctionKey,
     val ownerId: String,
-    val joinCode: String,         // we use ownerId as join code
+    val joinCode: String,
     val capacity: Int,
     val members: MutableList<GroupMemberBid>,
     val isSecondChance: Boolean = false
@@ -32,7 +32,7 @@ data class PendingGroupBid(
 
 data class FinalGroupBid(
     val key: AuctionKey,
-    val groupId: String,          // "group:<joinCode>"
+    val groupId: String,
     val members: List<GroupMemberBid>,
     val totalAmount: Int
 )
@@ -48,8 +48,8 @@ data class SecondChanceBid(
 
 data class UserBidSummary(
     val auctionKey: AuctionKey,
-    val amount: Int,              // your contribution or single bid
-    val groupTotalAmount: Int?,   // null for single, total for group
+    val amount: Int,
+    val groupTotalAmount: Int?,
     val isCurrentHighest: Boolean,
     val isActive: Boolean,
     val isGroup: Boolean
@@ -70,26 +70,23 @@ object BiddingManager {
 
     private val authRepo: AuthRepository = InMemoryAuthRepository
 
-    // single + group final bids (amount = total)
     private val bidsByAuction = mutableMapOf<AuctionKey, MutableList<BidEntry>>()
 
-    // pending groups: key (auction + owner) -> group (includes second-chance groups)
     private val pendingGroups =
-        mutableMapOf<Pair<AuctionKey, String>, PendingGroupBid>() // (key, ownerId)
+        mutableMapOf<Pair<AuctionKey, String>, PendingGroupBid>()
 
-    // finalised group bids (for refunds + history)
     private val finalGroupBids = mutableListOf<FinalGroupBid>()
 
-    // per-user group bid history (last 10)
     private val userGroupHistory =
         mutableMapOf<String, MutableList<UserGroupBidRecord>>()
 
-    // second-chance offers for single-person rooms
     private val pendingSecondChances = mutableListOf<SecondChanceBid>()
     private val auctionsWithSecondChance = mutableSetOf<AuctionKey>()
 
-    // (AuctionKey, id) where id is single userId OR group ownerId that already refused a second chance
     private val refusedSecondChances = mutableSetOf<Pair<AuctionKey, String>>()
+
+    // 🔹 Dev-only: force-close auctions (used by "Close auction now" button)
+    private val forceClosedAuctions = mutableSetOf<AuctionKey>()
 
     data class UserGroupBidRecord(
         val auctionKey: AuctionKey,
@@ -99,11 +96,10 @@ object BiddingManager {
     )
 
     private fun getEndTime(key: AuctionKey): LocalDateTime {
-        // Bid ends 1 week before reservation date at midnight
+        // Bid ends 1 week before reservation date
         return key.reservationDate.minusWeeks(1).atStartOfDay()
     }
 
-    // ---------- common helpers ----------
 
     fun getCurrentBid(key: AuctionKey): Int {
         val bids = bidsByAuction[key] ?: return 0
@@ -122,6 +118,20 @@ object BiddingManager {
             ?: emptyList()
     }
 
+    fun isAuctionEnded(
+        key: AuctionKey,
+        now: LocalDateTime = LocalDateTime.now()
+    ): Boolean {
+        return !now.isBefore(getEndTime(key)) || forceClosedAuctions.contains(key)
+    }
+
+    /**
+     * Dev-only: mark an auction as ended immediately.
+     */
+    fun forceCloseAuction(key: AuctionKey) {
+        forceClosedAuctions.add(key)
+    }
+
     // ---------- SINGLE-PERSON BIDDING ----------
 
     fun placeSingleBid(
@@ -137,8 +147,7 @@ object BiddingManager {
             )
         }
 
-        val endTime = getEndTime(key)
-        if (!now.isBefore(endTime)) {
+        if (isAuctionEnded(key, now)) {
             return BidResult(
                 success = false,
                 errorMessage = "Bidding has ended for this reservation."
@@ -207,12 +216,11 @@ object BiddingManager {
         }
     }
 
-    // ---------- GROUP BIDDING (MULTI-PERSON ROOMS) ----------
-
     fun startGroupBid(
         key: AuctionKey,
         ownerId: String,
-        amount: Int
+        amount: Int,
+        now: LocalDateTime = LocalDateTime.now()
     ): BidResult {
         if (key.capacity <= 1) {
             return BidResult(
@@ -226,8 +234,7 @@ object BiddingManager {
                 errorMessage = "Bid amount must be positive."
             )
         }
-        val endTime = getEndTime(key)
-        if (!LocalDateTime.now().isBefore(endTime)) {
+        if (isAuctionEnded(key, now)) {
             return BidResult(
                 success = false,
                 errorMessage = "Bidding has ended for this reservation."
@@ -348,8 +355,6 @@ object BiddingManager {
             return BidResult(success = true)
         }
 
-        // Second-chance group cancelled: mark refused for this owner,
-        // and try to offer the next highest group a second chance.
         refusedSecondChances.add(key to group.ownerId)
 
         val created = offerNextGroupSecondChance(key)
@@ -376,8 +381,7 @@ object BiddingManager {
             )
         }
 
-        val endTime = getEndTime(key)
-        if (!now.isBefore(endTime)) {
+        if (isAuctionEnded(key, now)) {
             return BidResult(
                 success = false,
                 errorMessage = "Bidding has ended for this reservation."
@@ -390,8 +394,6 @@ object BiddingManager {
         }
 
         val currentBid = getCurrentBid(key)
-        // For normal groups, they must beat current bid.
-        // For second-chance groups, they can match their previous total (currentBid).
         if (!group.isSecondChance && total <= currentBid) {
             return BidResult(
                 success = false,
@@ -399,7 +401,6 @@ object BiddingManager {
             )
         }
 
-        // Check every member has enough tokens
         for (m in group.members) {
             val tokens = authRepo.getTokens(m.userId)
             if (m.amount > tokens) {
@@ -412,18 +413,15 @@ object BiddingManager {
 
         val list = bidsByAuction.getOrPut(key) { mutableListOf() }
 
-        // Refund previous highest (single or group)
         val previousHighest = getHighestBidEntry(key)
         if (previousHighest != null) {
             refundBid(previousHighest)
         }
 
-        // Deduct tokens from each member
         group.members.forEach { m ->
             authRepo.addTokens(m.userId, -m.amount)
         }
 
-        // Record as group bid
         val groupId = "group:${group.ownerId}"
         val entry = BidEntry(
             bidderId = groupId,
@@ -432,7 +430,6 @@ object BiddingManager {
         )
         list.add(entry)
 
-        // Save final group info for possible refunds later
         finalGroupBids.add(
             FinalGroupBid(
                 key = key,
@@ -442,7 +439,6 @@ object BiddingManager {
             )
         )
 
-        // Add to user group bid history
         group.members.forEach { m ->
             val h = userGroupHistory.getOrPut(m.userId) { mutableListOf() }
             h.add(
@@ -457,7 +453,6 @@ object BiddingManager {
             if (h.size > 10) h.removeLast()
         }
 
-        // Remove pending group
         pendingGroups.remove(pairKey)
 
         if (group.isSecondChance) {
@@ -480,11 +475,6 @@ object BiddingManager {
         return pendingGroups[key to joinCode]
     }
 
-    // ---------- SECOND-CHANCE HELPERS FOR GROUPS ----------
-
-    /**
-     * Offer the next highest group (different owner, not refused) a second-chance pending bid.
-     */
     private fun offerNextGroupSecondChance(key: AuctionKey): Boolean {
         val bids = bidsByAuction[key] ?: return false
 
@@ -518,8 +508,6 @@ object BiddingManager {
         return true
     }
 
-    // ---------- SECOND-CHANCE BIDS AFTER CANCELLATION (SINGLE ROOMS) ----------
-
     fun cancelReservationForUser(
         key: AuctionKey,
         userId: String,
@@ -533,7 +521,6 @@ object BiddingManager {
             )
         }
 
-        // Must be at least one day before reservation date
         val latestCancelTime = key.reservationDate.minusDays(1).atStartOfDay()
         if (!now.isBefore(latestCancelTime)) {
             return BidResult(
@@ -548,7 +535,6 @@ object BiddingManager {
         val top = getHighestBidEntry(key)
             ?: return BidResult(success = false, errorMessage = "No winning bid found.")
 
-        // Only allow cancellation if the current overall winner is this single user
         if (top.bidderId.startsWith("group:") ||
             top.bidderId != userId || top.amount != amount
         ) {
@@ -616,10 +602,8 @@ object BiddingManager {
             )
         }
 
-        // Deduct tokens
         authRepo.addTokens(userId, -needed)
 
-        // Remove pending offer and mark auction as resolved
         pendingSecondChances.remove(sc)
         auctionsWithSecondChance.remove(key)
 
@@ -637,7 +621,7 @@ object BiddingManager {
         pendingSecondChances.remove(sc)
         refusedSecondChances.add(key to userId)
 
-        // Offer to next highest bidder if any
+        // Offer to next highest bidder
         val list = bidsByAuction[key] ?: emptyList()
         val nextCandidate = list
             .filter {
@@ -655,20 +639,13 @@ object BiddingManager {
                 )
             )
         } else {
-            // No more candidates
             auctionsWithSecondChance.remove(key)
         }
 
         return BidResult(success = true)
     }
 
-    // ---------- GROUP RESERVATION CANCELLATION (FINAL RESERVATION) ----------
 
-    /**
-     * Cancel a FINAL group reservation (winner is a group).
-     * Only the group owner can do this. Each member gets 50% refund, and
-     * the next highest group may receive a second-chance pending group.
-     */
     fun cancelGroupReservationForOwner(
         key: AuctionKey,
         ownerId: String,
@@ -681,7 +658,6 @@ object BiddingManager {
             )
         }
 
-        // Must be at least one day before reservation date
         val latestCancelTime = key.reservationDate.minusDays(1).atStartOfDay()
         if (!now.isBefore(latestCancelTime)) {
             return BidResult(
@@ -722,17 +698,13 @@ object BiddingManager {
         // Mark second-chance mode
         auctionsWithSecondChance.add(key)
 
-        // Try to offer second chance to the next group
         val created = offerNextGroupSecondChance(key)
         if (!created) {
-            // No second-chance group
             auctionsWithSecondChance.remove(key)
         }
 
         return BidResult(success = true)
     }
-
-    // ---------- USER HISTORY ----------
 
     fun getUserBidHistory(
         userId: String,
@@ -743,8 +715,7 @@ object BiddingManager {
 
         bidsByAuction.forEach { (key, list) ->
             list.filter { it.bidderId == userId }.forEach { bid ->
-                val endTime = getEndTime(key)
-                val isActive = now.isBefore(endTime)
+                val isActive = !isAuctionEnded(key, now)
                 val current = getCurrentBid(key)
                 val isCurrentHighest = (bid.amount == current) && isActive
                 singles += UserBidSummary(
@@ -759,8 +730,7 @@ object BiddingManager {
         }
 
         val groups = userGroupHistory[userId].orEmpty().map { rec ->
-            val endTime = getEndTime(rec.auctionKey)
-            val isActive = now.isBefore(endTime)
+            val isActive = !isAuctionEnded(rec.auctionKey, now)
             val current = getCurrentBid(rec.auctionKey)
             val isCurrentHighest = (rec.groupTotal == current) && isActive
             UserBidSummary(
@@ -794,15 +764,13 @@ object BiddingManager {
         bidsByAuction.forEach { (key, list) ->
             if (list.isEmpty()) return@forEach
 
-            val endTime = getEndTime(key)
-            if (now.isBefore(endTime)) return@forEach
+            if (!isAuctionEnded(key, now)) return@forEach
 
             if (key in auctionsWithSecondChance) return@forEach
 
             val top = list.maxByOrNull { it.amount } ?: return@forEach
 
             if (!top.bidderId.startsWith("group:")) {
-                // single person winner
                 if (top.bidderId == userId) {
                     results += ReservationSummary(
                         auctionKey = key,
@@ -810,7 +778,6 @@ object BiddingManager {
                     )
                 }
             } else {
-                // group winner
                 val groupId = top.bidderId
                 val fg = finalGroupBids.lastOrNull {
                     it.groupId == groupId && it.key == key && it.totalAmount == top.amount

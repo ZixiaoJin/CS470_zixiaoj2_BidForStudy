@@ -126,24 +126,26 @@ fun AvailableRoomsScreen(
                         )
                     } else if (isActiveWindow) {
                         Text(
-                            text = "Select a single-person room to place a bid.",
+                            text = "Select a room to view bidding options.",
                             style = MaterialTheme.typography.bodyMedium
                         )
                     }
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        items(slots) { slot ->
-                            RoomSlotCard(
-                                slot = slot,
-                                reservationDate = selectedDate,
-                                isActiveWindow = isActiveWindow,
-                                isWithinWeek = isWithinWeekButNotPast,
-                                onClick = { selectedSlotState.value = slot }
-                            )
+                    if (showRooms) {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            items(slots) { slot ->
+                                RoomSlotCard(
+                                    slot = slot,
+                                    reservationDate = selectedDate,
+                                    isActiveWindow = isActiveWindow,
+                                    isWithinWeek = isWithinWeekButNotPast,
+                                    onClick = { selectedSlotState.value = slot }
+                                )
+                            }
                         }
                     }
                 }
@@ -181,6 +183,7 @@ private fun RoomSlotCard(
         )
     }
     val currentBid = BiddingManager.getCurrentBid(key)
+    val auctionEnded = BiddingManager.isAuctionEnded(key)
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -191,10 +194,7 @@ private fun RoomSlotCard(
                 .padding(16.dp)
                 .fillMaxWidth()
         ) {
-            Text(
-                text = "Room: ${slot.roomNumber}",
-                style = MaterialTheme.typography.titleMedium
-            )
+            Text("Room: ${slot.roomNumber}", style = MaterialTheme.typography.titleMedium)
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = if (slot.capacity == 1)
@@ -203,25 +203,20 @@ private fun RoomSlotCard(
                     "Group room: up to ${slot.capacity} people",
                 style = MaterialTheme.typography.bodyMedium
             )
-            Text(
-                text = "Time: ${slot.timeRange}",
-                style = MaterialTheme.typography.bodyMedium
-            )
-            Text(
-                text = "Current bid: $currentBid tokens",
-                style = MaterialTheme.typography.bodyMedium
-            )
+            Text("Time: ${slot.timeRange}", style = MaterialTheme.typography.bodyMedium)
+            Text("Current bid: $currentBid tokens", style = MaterialTheme.typography.bodyMedium)
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Bidding is open only between 1 week and 1 month ahead
-            val canBid = isActiveWindow
+            val canBid = isActiveWindow && !auctionEnded
 
             val buttonLabel = when {
+                auctionEnded -> "View bid (closed)"
                 isWithinWeek -> "View bid (closed)"
                 canBid && slot.capacity == 1 -> "Place bid (active)"
                 canBid && slot.capacity > 1 -> "Group bid (active)"
                 else -> "View"
             }
+
             Button(
                 onClick = onClick,
                 modifier = Modifier.fillMaxWidth()
@@ -253,11 +248,12 @@ private fun BidDetailPage(
 
     val endTime = key.reservationDate.minusWeeks(1).atStartOfDay()
     val now = LocalDateTime.now()
+    val auctionEnded = BiddingManager.isAuctionEnded(key, now)
 
-    val singleBidActive = (slot.capacity == 1) && now.isBefore(endTime) && isActiveWindow
-    val groupBidActive  = (slot.capacity > 1) && now.isBefore(endTime) && isActiveWindow
+    val singleBidActive = (slot.capacity == 1) && !auctionEnded && isActiveWindow
+    val groupBidActive  = (slot.capacity > 1) && !auctionEnded && isActiveWindow
 
-    val bidStatusText = if (singleBidActive || groupBidActive) "Active" else "Closed"
+    val bidStatusText = if (auctionEnded) "Closed" else "Active"
 
     var currentBid by remember { mutableStateOf(BiddingManager.getCurrentBid(key)) }
     var bidHistory by remember { mutableStateOf(BiddingManager.getLastBidsForAuction(key, 5)) }
@@ -281,7 +277,7 @@ private fun BidDetailPage(
         Text("Capacity: ${slot.capacity}", style = MaterialTheme.typography.bodyMedium)
         Text("Reservation date: $date", style = MaterialTheme.typography.bodyMedium)
         Text(
-            "Bid end time: $endTime",
+            "Bid end time (normal): $endTime",
             style = MaterialTheme.typography.bodyMedium
         )
         Text(
@@ -294,6 +290,23 @@ private fun BidDetailPage(
 
         Text("Your available tokens: $userTokens", style = MaterialTheme.typography.bodyMedium)
         Spacer(modifier = Modifier.height(12.dp))
+
+        // 🔹 DEV-ONLY: Close auction immediately
+        if (!auctionEnded) {
+            OutlinedButton(
+                onClick = {
+                    BiddingManager.forceCloseAuction(key)
+                    currentBid = BiddingManager.getCurrentBid(key)
+                    bidHistory = BiddingManager.getLastBidsForAuction(key, 5)
+                    error = null
+                    message = "Auction forcibly closed for demo. Bidding is now closed."
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("DEV: Close auction now")
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+        }
 
         if (slot.capacity == 1) {
             OutlinedTextField(
@@ -476,7 +489,6 @@ private fun BidDetailPage(
             Spacer(modifier = Modifier.height(16.dp))
         }
 
-
         error?.let {
             Text(text = it, color = MaterialTheme.colorScheme.error)
             Spacer(modifier = Modifier.height(4.dp))
@@ -501,7 +513,7 @@ private fun BidDetailPage(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        Button(onClick = onBackToList) {
+        Button(onClick = onBackToList, modifier = Modifier.fillMaxWidth()) {
             Text("Back to rooms")
         }
     }
